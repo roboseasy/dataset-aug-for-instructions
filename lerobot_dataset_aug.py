@@ -2,6 +2,7 @@
 
 """
 Unified Dataset Augmentation & Merge Script for Language Instructions
+(SELF-CONTAINED: 외부 스크립트 의존성 없음)
 
 사용 예시:
     # 인터랙티브 모드
@@ -17,45 +18,248 @@ Unified Dataset Augmentation & Merge Script for Language Instructions
 
     # 명령줄 직접 입력
     lerobot-dataset-aug \
-        --dataset_load_repo_id="roboseasy/pick_and_place_1" \
-        --dataset_output_repo_id="roboseasy/pick_and_place_aug_test" \
+        --dataset_load_repo_id="roboseasy/soarm_pick_and_place_socks_2" \
+        --dataset_output_repo_id="roboseasy/soarm_pick_and_place_socks_aug" \
         --instructions "Pick up the sock and put it in the basket" \
         --instructions "Grab the sock and place it into the basket" \
         --instructions "Task the sock and put it into the basket" \
+        --instructions "Lift the sock and drop it into the basket" \
+        --instructions "Pick the sock and basket it" \
         --push_to_hub
-        
-        
-python -c "import pandas as pd; df = pd.read_parquet('/home/khw/.cache/huggingface/lerobot/roboseasy/pick_and_place_aug_test/meta/tasks.parquet'); print(df)"
-
 """
 
 import argparse
 import os
 import sys
 import shutil
+import json
+from pathlib import Path
 from tqdm import tqdm
-
-# test-duplicate.py와 merge_datasets_simple.py의 함수 직접 import
-import importlib.util
-
-def import_from_path(module_path, func_name):
-    spec = importlib.util.spec_from_file_location("mod", module_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return getattr(mod, func_name)
-
-duplicate_dataset = import_from_path(
-    os.path.join(os.path.dirname(__file__), "test-duplicate.py"),
-    "duplicate_dataset"
-)
-merge_datasets = import_from_path(
-    os.path.join(os.path.dirname(__file__), "merge_datasets_simple.py"),
-    "merge_datasets"
-)
+import pandas as pd
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from huggingface_hub import HfApi
 
 def get_dataset_path(repo_id):
-    from pathlib import Path
     return Path.home() / ".cache" / "huggingface" / "lerobot" / repo_id
+
+def duplicate_dataset(src_repo_id, dst_repo_id, single_task):
+    """
+    허깅페이스에서 직접 로드 → 전체 복사 → single_task만 변경
+    """
+    print(f"\n{'='*60}")
+    print(f"Duplicating: {src_repo_id}")
+    print(f"        To: {dst_repo_id}")
+    print(f"      Task: {single_task}")
+    print(f"{'='*60}\n")
+    # 1. 원본 데이터셋 로드
+    print("Step 1: Loading dataset from Hugging Face...")
+    src_ds = LeRobotDataset(src_repo_id)
+    src_root = Path(src_ds.root)
+    print(f"  Original episodes: {src_ds.meta.total_episodes}")
+    print(f"  Original frames: {src_ds.meta.total_frames}")
+    print(f"  Root: {src_root}")
+    # 2. 새 디렉토리 경로 설정
+    dst_root = get_dataset_path(dst_repo_id)
+    print(f"\nStep 2: Copying to {dst_root}...")
+    if dst_root.exists():
+        print("  Removing existing directory...")
+        shutil.rmtree(dst_root)
+    # 3. 전체 복사
+    shutil.copytree(src_root, dst_root)
+    print("  ✓ Copied all files (videos, data, meta)")
+    # 4. single_task만 변경
+    print(f"\nStep 3: Updating single_task...")
+    info_path = dst_root / "meta" / "info.json"
+    with open(info_path, "r") as f:
+        info = json.load(f)
+    old_task = info.get("single_task", "N/A")
+    info["single_task"] = single_task
+    with open(info_path, "w") as f:
+        json.dump(info, f, indent=2, ensure_ascii=False)
+    print(f"  Old: {old_task}")
+    print(f"  New: {single_task}")
+    print(f"\n{'='*60}")
+    print(f"✓ Complete!")
+    print(f"{'='*60}")
+    print(f"  Local: {dst_root}")
+    print(f"{'='*60}\n")
+    return dst_root
+
+def merge_datasets(repo_ids, output_repo_id, push_to_hub=False):
+    dataset_paths = [get_dataset_path(rid) for rid in repo_ids]
+    output_path = get_dataset_path(output_repo_id)
+    print(f"\n{'='*70}")
+    print(f"Generic N-way Dataset Merging")
+    print(f"{'='*70}")
+    for i, (rid, p) in enumerate(zip(repo_ids, dataset_paths)):
+        print(f"Repo {i}: {rid} -> {p}")
+    print(f"Output:    {output_path}")
+    print(f"{'='*70}\n")
+    # Validate input datasets
+    for p in dataset_paths:
+        if not p.exists():
+            raise FileNotFoundError(f"Dataset not found: {p}")
+    # Load metadata
+    def load_info_json(dataset_path):
+        info_path = dataset_path / "meta" / "info.json"
+        with open(info_path, "r") as f:
+            return json.load(f)
+    def load_tasks(dataset_path):
+        tasks_path = dataset_path / "meta" / "tasks.parquet"
+        if tasks_path.exists():
+            df = pd.read_parquet(tasks_path)
+            return list(df.index)
+        return []
+    infos = [load_info_json(p) for p in dataset_paths]
+    tasks_list = [load_tasks(p) for p in dataset_paths]
+    total_episodes_list = [info["total_episodes"] for info in infos]
+    total_frames_list = [info["total_frames"] for info in infos]
+    task_names = []
+    for i, tasks in enumerate(tasks_list):
+        if tasks:
+            task_names.append(tasks[0])
+        else:
+            task_names.append(infos[i].get("single_task", f"Task {i+1}"))
+    # Phase 1: Copy first dataset as base
+    if output_path.exists():
+        shutil.rmtree(output_path)
+    shutil.copytree(dataset_paths[0], output_path)
+    # Phase 2: Merge remaining datasets
+    episode_offset = total_episodes_list[0]
+    frame_offset = total_frames_list[0]
+    video_file_offset = {}
+    cameras = ["observation.images.top", "observation.images.wrist"]
+    for cam in cameras:
+        cam_dir = output_path / "videos" / cam / "chunk-000"
+        video_file_offset[cam] = len(list(cam_dir.glob("file-*.mp4")))
+    data_output_dir = output_path / "data" / "chunk-000"
+    episodes_output_dir = output_path / "meta" / "episodes" / "chunk-000"
+    data_file_counter = len(list(data_output_dir.glob("file-*.parquet")))
+    ep_file_counter = len(list(episodes_output_dir.glob("file-*.parquet")))
+    last_data_file = sorted(data_output_dir.glob("file-*.parquet"))[-1]
+    last_index = pd.read_parquet(last_data_file)["index"].max()
+    current_index = last_index + 1
+    for i in range(1, len(dataset_paths)):
+        # Data files
+        data_dir = dataset_paths[i] / "data" / "chunk-000"
+        data_files = sorted(data_dir.glob("file-*.parquet"))
+        for data_file in data_files:
+            df = pd.read_parquet(data_file)
+            df["episode_index"] = df["episode_index"] + episode_offset
+            df["task_index"] = i
+            num_frames = len(df)
+            df["index"] = range(current_index, current_index + num_frames)
+            output_file = data_output_dir / f"file-{data_file_counter:03d}.parquet"
+            df.to_parquet(output_file, index=False)
+            data_file_counter += 1
+            current_index += num_frames
+        # Episodes files
+        ep_dir = dataset_paths[i] / "meta" / "episodes" / "chunk-000"
+        ep_files = sorted(ep_dir.glob("file-*.parquet"))
+        for ep_file in ep_files:
+            ep_df = pd.read_parquet(ep_file)
+            ep_df["episode_index"] = ep_df["episode_index"] + episode_offset
+            if "dataset_from_index" in ep_df.columns:
+                ep_df["dataset_from_index"] = ep_df["dataset_from_index"] + frame_offset
+            if "dataset_to_index" in ep_df.columns:
+                ep_df["dataset_to_index"] = ep_df["dataset_to_index"] + frame_offset
+            if "tasks" in ep_df.columns:
+                ep_df["tasks"] = ep_df["tasks"].apply(lambda x: [task_names[i]] if isinstance(x, list) else [task_names[i]])
+            for cam in cameras:
+                file_index_col = f"videos/{cam}/file_index"
+                to_timestamp_col = f"videos/{cam}/to_timestamp"
+                if file_index_col in ep_df.columns:
+                    ep_df[file_index_col] = ep_df[file_index_col] + video_file_offset[cam]
+                if to_timestamp_col in ep_df.columns:
+                    ep_df[to_timestamp_col] = ep_df[to_timestamp_col] - 0.01
+            if "task_index" in ep_df.columns:
+                ep_df = ep_df.drop(columns=["task_index"])
+            output_file = episodes_output_dir / f"file-{ep_file_counter:03d}.parquet"
+            ep_df.to_parquet(output_file, index=False)
+            ep_file_counter += 1
+        # Video files
+        for cam in cameras:
+            cam_dir = dataset_paths[i] / "videos" / cam / "chunk-000"
+            output_cam_dir = output_path / "videos" / cam / "chunk-000"
+            video_files = sorted(cam_dir.glob("file-*.mp4"))
+            v_counter = video_file_offset[cam]
+            for video_file in video_files:
+                output_video = output_cam_dir / f"file-{v_counter:03d}.mp4"
+                shutil.copy2(video_file, output_video)
+                v_counter += 1
+            video_file_offset[cam] = v_counter
+        episode_offset += total_episodes_list[i]
+        frame_offset += total_frames_list[i]
+    # Phase 3: Update metadata
+    info_output_path = output_path / "meta" / "info.json"
+    with open(info_output_path, "r") as f:
+        info_merged = json.load(f)
+    info_merged["total_episodes"] = sum(total_episodes_list)
+    info_merged["total_frames"] = sum(total_frames_list)
+    info_merged["total_tasks"] = len(repo_ids)
+    info_merged["splits"]["train"] = f"0:{sum(total_episodes_list)}"
+    if "single_task" in info_merged:
+        del info_merged["single_task"]
+    with open(info_output_path, "w") as f:
+        json.dump(info_merged, f, indent=4, ensure_ascii=False)
+    # Create tasks.parquet
+    tasks_parquet_path = output_path / "meta" / "tasks.parquet"
+    tasks_df = pd.DataFrame({
+        "task_index": list(range(len(task_names)))
+    }, index=task_names)
+    tasks_df.to_parquet(tasks_parquet_path)
+    # Update stats.json
+    stats_path = output_path / "meta" / "stats.json"
+    all_data_files = sorted((output_path / "data" / "chunk-000").glob("file-*.parquet"))
+    dfs = [pd.read_parquet(f) for f in all_data_files]
+    merged_df = pd.concat(dfs, ignore_index=True)
+    stats = {}
+    for column in merged_df.columns:
+        if column in ["observation.images.top", "observation.images.wrist"]:
+            continue
+        col_data = merged_df[column]
+        if pd.api.types.is_numeric_dtype(col_data):
+            stats[column] = {
+                "min": [float(col_data.min())],
+                "max": [float(col_data.max())],
+                "mean": [float(col_data.mean())],
+                "std": [float(col_data.std())],
+                "count": [len(col_data)],
+                "q01": [float(col_data.quantile(0.01))],
+                "q10": [float(col_data.quantile(0.10))],
+                "q50": [float(col_data.quantile(0.50))],
+                "q90": [float(col_data.quantile(0.90))],
+                "q99": [float(col_data.quantile(0.99))]
+            }
+    if stats_path.exists():
+        with open(stats_path, "r") as f:
+            old_stats = json.load(f)
+        if "observation.images.top" in old_stats:
+            stats["observation.images.top"] = old_stats["observation.images.top"]
+        if "observation.images.wrist" in old_stats:
+            stats["observation.images.wrist"] = old_stats["observation.images.wrist"]
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=4, ensure_ascii=False)
+    # Phase 4: Push to hub if requested
+    if push_to_hub:
+        api = HfApi()
+        try:
+            api.create_repo(repo_id=output_repo_id, repo_type="dataset", exist_ok=True)
+        except Exception as e:
+            print(f"Repository creation: {e}")
+        api.upload_folder(
+            folder_path=str(output_path),
+            repo_id=output_repo_id,
+            repo_type="dataset"
+        )
+        try:
+            api.create_tag(
+                repo_id=output_repo_id,
+                tag="v3.0",
+                repo_type="dataset"
+            )
+        except Exception as e:
+            print(f"Warning: Could not create tag (may already exist): {e}")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Augment dataset with multiple language instructions.")
@@ -105,8 +309,7 @@ def main():
     if not instructions:
         print("지시어가 입력되지 않았습니다. 종료합니다.")
         sys.exit(1)
-
-    # 1. instruction별 복제본 생성 (test-duplicate.py 활용)
+    # 1. instruction별 복제본 생성
     inst_repo_ids = []
     for idx, instruction in enumerate(tqdm(instructions, desc="지시어별 복제")):
         inst_repo_id = f"{args.dataset_output_repo_id}_inst{idx}"
@@ -116,14 +319,12 @@ def main():
             single_task=instruction
         )
         inst_repo_ids.append(inst_repo_id)
-
-    # 2. 병합 및 업로드 (merge_datasets_simple.py 활용)
+    # 2. 병합 및 업로드
     merge_datasets(
         repo_ids=inst_repo_ids,
         output_repo_id=args.dataset_output_repo_id,
         push_to_hub=args.push_to_hub
     )
-
     # 3. 임시 복제본 자동 삭제(clean-up)
     for inst_repo_id in inst_repo_ids:
         inst_path = get_dataset_path(inst_repo_id)
@@ -133,7 +334,6 @@ def main():
                 print(f"임시 복제본 삭제 완료: {inst_path}")
             except Exception as e:
                 print(f"임시 복제본 삭제 실패: {inst_path} ({e})")
-
     print("Augmentation and merge complete.")
     print("  Output repo_id:", args.dataset_output_repo_id)
     print("  Instructions:", instructions)
