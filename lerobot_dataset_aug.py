@@ -18,7 +18,7 @@ Unified Dataset Augmentation & Merge Script for Language Instructions
 
     # 명령줄 직접 입력
     lerobot-dataset-aug \
-        --dataset_load_repo_id="roboseasy/soarm_pick_and_place_socks_2" \
+        --dataset_load_repo_id="roboseasy/soarm_pick_and_place_socks" \
         --dataset_output_repo_id="roboseasy/soarm_pick_and_place_socks_aug" \
         --instructions "Pick up the sock and put it in the basket" \
         --instructions "Grab the sock and place it into the basket" \
