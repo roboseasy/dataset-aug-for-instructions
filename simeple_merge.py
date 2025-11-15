@@ -13,7 +13,7 @@ python simeple_merge.py \
   --output_repo_id roboseasy/soarm_pick_and_place_blue_red_merged \
   --push_to_hub
 
-python lerobot/src/lerobot/scripts/simeple_merge.py \
+python src/lerobot/scripts/simeple_merge.py \
     --dataset_repo_ids roboseasy/soarm_pick_and_place_blue_pen roboseasy/soarm_pick_and_place_red_pen \
     --output_repo_id roboseasy/soarm_pick_and_place_blue_red_merged \
     --push_to_hub
@@ -186,17 +186,22 @@ def robust_merge_datasets(repo_ids, output_repo_id, push_to_hub=False):
         "task_index": list(range(len(task_names_accum)))
     }, index=task_names_accum)
     tasks_df.to_parquet(output_path / "meta" / "tasks.parquet")
-    # stats.json 갱신 (간단히 누적)
+    # stats.json 갱신 (모든 key superset 포함)
     stats_path = output_path / "meta" / "stats.json"
     all_data_files = sorted((output_path / "data" / "chunk-000").glob("file-*.parquet"))
     dfs = [pd.read_parquet(f) for f in all_data_files]
     merged_df = pd.concat(dfs, ignore_index=True)
+    # 병합 대상 데이터셋들의 stats.json key superset 수집
+    all_stats_keys = set(merged_df.columns)
+    # 기존 stats.json에서 key도 모두 포함
+    if stats_path.exists():
+        with open(stats_path, "r") as f:
+            old_stats = json.load(f)
+        all_stats_keys.update(old_stats.keys())
     stats = {}
-    for column in merged_df.columns:
-        if column in ["observation.images.top", "observation.images.wrist"]:
-            continue
-        col_data = merged_df[column]
-        if pd.api.types.is_numeric_dtype(col_data):
+    for column in all_stats_keys:
+        if column in merged_df.columns and pd.api.types.is_numeric_dtype(merged_df[column]):
+            col_data = merged_df[column]
             stats[column] = {
                 "min": [float(col_data.min())],
                 "max": [float(col_data.max())],
@@ -209,13 +214,11 @@ def robust_merge_datasets(repo_ids, output_repo_id, push_to_hub=False):
                 "q90": [float(col_data.quantile(0.90))],
                 "q99": [float(col_data.quantile(0.99))]
             }
-    if stats_path.exists():
-        with open(stats_path, "r") as f:
-            old_stats = json.load(f)
-        if "observation.images.top" in old_stats:
-            stats["observation.images.top"] = old_stats["observation.images.top"]
-        if "observation.images.wrist" in old_stats:
-            stats["observation.images.wrist"] = old_stats["observation.images.wrist"]
+        elif stats_path.exists() and column in old_stats:
+            stats[column] = old_stats[column]
+        else:
+            # 없는 경우 빈 값으로라도 포함
+            stats[column] = {}
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=4, ensure_ascii=False)
     # 허브 업로드
